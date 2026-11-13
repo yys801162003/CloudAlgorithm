@@ -1,0 +1,15 @@
+# Dependencies and IDE/build caches
+node_modules/
+.vs/
+bin/
+obj/
+Debug/
+Release/
+x64/
+x86/
+*.user
+*.suo
+*.obj
+*.pdb
+*.ilk
+*.ipch
