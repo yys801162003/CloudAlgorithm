@@ -47,6 +47,7 @@
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <SDLCheck>true</SDLCheck>
+      <ExceptionHandling>Sync</ExceptionHandling>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp17</LanguageStandard>
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
@@ -54,11 +55,11 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>User32.lib;Gdi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>User32.lib;Gdi32.lib;OpenGL32.lib;Comdlg32.lib;Shell32.lib;Ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
-  <ItemGroup><ClCompile Include="main.cpp" /></ItemGroup>
-  <ItemGroup><ClInclude Include="resource.h" /></ItemGroup>
+  <ItemGroup><ClCompile Include="main.cpp" /><ClCompile Include="PointCloud.cpp" /></ItemGroup>
+  <ItemGroup><ClInclude Include="resource.h" /><ClInclude Include="PointCloud.h" /></ItemGroup>
   <ItemGroup><ResourceCompile Include="ResizableDialog.rc" /></ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

@@ -13,3 +13,11 @@ x86/
 *.pdb
 *.ilk
 *.ipch
+
+# Additional generated build and test files
+*.exe
+*.res
+*.o
+.cache/
+core-test-data/
+core-tests
