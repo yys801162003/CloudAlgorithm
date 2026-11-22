@@ -1,6 +1,16 @@
 # CloudAlgorithm
 The Algorithm of analysis and manupulation of Cloud Points
 
+## VC2019 PNG/JPEG 烟雾识别
+
+**[下载烟雾识别完整工程 ZIP](https://github.com/yys801162003/CloudAlgorithm/raw/refs/heads/main/downloads/SmokeDetector_VS2019.zip)** · [编译与操作说明](VC2019/SmokeDetector/README.md)
+
+独立的 `VC2019/SmokeDetector/SmokeDetector.sln` 工程提供 OpenCV 颜色/纹理规则和已训练 YOLO11s 神经网络两种方法，三栏对比输入和标注结果，支持中文路径、后台检测、阈值调整与结果导出。模型已经包含，运行时在本地 CPU 推理，无需 Python。
+
+先运行工程内 `scripts/Setup-OpenCV.ps1` 配置官方 OpenCV 4.10.0，然后用 VS2019 选择 **x64 / Release** 编译。ZIP 包含源码、真实 ONNX 模型、示例、测试和许可，排除 OpenCV 依赖安装目录与编译缓存。
+
+此烟雾识别模块和所附模型采用 AGPL-3.0，模型来源与 OpenCV 许可见[第三方通知](VC2019/SmokeDetector/THIRD_PARTY_NOTICES.md)。传统规则仅识别疑似区域；神经网络分数不是准确率，未检出不等于无烟，需用独立场景样本评估。
+
 ## VC2019 点云工作台
 
 **[下载完整工程 ZIP](https://github.com/yys801162003/CloudAlgorithm/raw/refs/heads/main/downloads/PointCloudWorkbench_VS2019.zip)**

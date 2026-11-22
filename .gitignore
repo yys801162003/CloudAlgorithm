@@ -24,3 +24,9 @@ core-tests
 
 cylinder-test-data/
 cylinder-tests
+
+# Smoke detector local dependencies and configuration
+VC2019/SmokeDetector/third_party/
+VC2019/SmokeDetector/OpenCV.local.props
+VC2019/SmokeDetector/build-tests/
+*.part

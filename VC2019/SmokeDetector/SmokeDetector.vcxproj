@@ -1,0 +1,66 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>16.0</VCProjectVersion>
+    <ProjectGuid>{9D48DB32-8200-4F12-B313-0F77265ECBD0}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <RootNamespace>SmokeDetector</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <PlatformToolset>v142</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(ProjectDir)OpenCV.local.props" Condition="Exists('$(ProjectDir)OpenCV.local.props')" />
+  <PropertyGroup>
+    <OpenCVRoot Condition="'$(OpenCVRoot)'==''">$(ProjectDir)third_party\opencv\build</OpenCVRoot>
+    <OpenCVSuffix Condition="'$(Configuration)'=='Debug'">d</OpenCVSuffix>
+    <OutDir>$(SolutionDir)bin\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(SolutionDir)obj\$(Platform)\$(Configuration)\</IntDir>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Debug'">MultiThreadedDebugDLL</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(Configuration)'=='Release'">MultiThreadedDLL</RuntimeLibrary>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(OpenCVRoot)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <AdditionalLibraryDirectories>$(OpenCVRoot)\x64\vc16\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>opencv_world4100$(OpenCVSuffix).lib;User32.lib;Gdi32.lib;Comdlg32.lib;Shell32.lib;Ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="main.cpp" /><ClCompile Include="SmokeEngine.cpp" />
+    <ClInclude Include="SmokeEngine.h" /><ClInclude Include="resource.h" />
+    <ResourceCompile Include="SmokeDetector.rc" />
+  </ItemGroup>
+  <ItemGroup><RuntimeModels Include="models\*.*" /><LicenseFiles Include="LICENSE-AGPL-3.0.txt;THIRD_PARTY_NOTICES.md" /></ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="ValidateOpenCV" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(OpenCVRoot)\include\opencv2\core.hpp')" Text="OpenCV not configured. Run scripts/Setup-OpenCV.ps1 or set OpenCVRoot in OpenCV.local.props to the OpenCV 4.10.0 build directory." />
+    <Error Condition="!Exists('$(OpenCVRoot)\x64\vc16\lib\opencv_world4100$(OpenCVSuffix).lib')" Text="OpenCV 4.10.0 x64/vc16 import library not found. Select x64 and verify OpenCVRoot." />
+  </Target>
+  <Target Name="CopyRuntimeAssets" AfterTargets="Build">
+    <Copy SourceFiles="$(OpenCVRoot)\x64\vc16\bin\opencv_world4100$(OpenCVSuffix).dll" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(RuntimeModels)" DestinationFolder="$(OutDir)models" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(LicenseFiles)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(ProjectDir)licenses\OpenCV-4.10-LICENSE.txt" DestinationFolder="$(OutDir)licenses" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

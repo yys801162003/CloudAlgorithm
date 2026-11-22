@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+#pragma once
+#define IDD_MAIN_DIALOG 101
+#define IDC_OPEN 1001
+#define IDC_RUN_CV 1002
+#define IDC_RUN_NN 1003
+#define IDC_RUN_BOTH 1004
+#define IDC_CANCEL 1005
+#define IDC_EXPORT 1006
+#define IDC_AREA_THRESHOLD 1007
+#define IDC_NN_THRESHOLD 1008
+#define IDC_PATH 1009
+#define IDC_MODEL 1010
+#define IDC_TITLE_ORIGINAL 1011
+#define IDC_TITLE_CV 1012
+#define IDC_TITLE_NN 1013
+#define IDC_VIEW_ORIGINAL 1014
+#define IDC_VIEW_CV 1015
+#define IDC_VIEW_NN 1016
+#define IDC_REPORT 1017
+#define IDC_STATUS 1018
