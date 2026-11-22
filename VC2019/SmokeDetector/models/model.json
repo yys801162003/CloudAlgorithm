@@ -1,0 +1,51 @@
+{
+  "model": "firewatch-yolo11s.onnx",
+  "source": "https://github.com/leskoont/firewatch",
+  "release": "v0.1.0",
+  "url": "https://github.com/leskoont/firewatch/releases/download/v0.1.0/firewatch-yolo11s.onnx",
+  "sha256": "1ab25ae6a26e711542e5b5e9670611476719532bc00ef1bd1a1657c01f24c2b4",
+  "license": "AGPL-3.0",
+  "author": "Max Nikonov / leskoont; architecture and pretrained lineage: Ultralytics YOLO11s",
+  "input": {
+    "shape": [
+      1,
+      3,
+      640,
+      640
+    ],
+    "layout": "NCHW",
+    "channels": "RGB",
+    "normalization": "float32 / 255",
+    "padding_value": 114,
+    "resize": "aspect-preserving letterbox"
+  },
+  "output": {
+    "shape": [
+      1,
+      6,
+      8400
+    ],
+    "columns": [
+      "cx",
+      "cy",
+      "w",
+      "h",
+      "smoke_score",
+      "fire_score"
+    ],
+    "coordinate_space": "640x640 network input",
+    "objectness": false,
+    "embedded_nms": false
+  },
+  "classes": {
+    "0": "smoke",
+    "1": "fire"
+  },
+  "default_confidence": 0.5,
+  "nms_iou": 0.45,
+  "upstream_source_revision": "b63a106e3554a8cfcdbd491fdde288ec80d3a759",
+  "notes": [
+    "This is a real trained detector, not a random or synthetic placeholder.",
+    "Scores are not calibrated probabilities; independently evaluate on deployment data."
+  ]
+}
