@@ -21,3 +21,6 @@ x86/
 .cache/
 core-test-data/
 core-tests
+
+cylinder-test-data/
+cylinder-tests
