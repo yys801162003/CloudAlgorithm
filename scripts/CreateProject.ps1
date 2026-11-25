@@ -31,6 +31,7 @@ The Algorithm of analysis and manupulation of Cloud Points
 - 分别读取两份 PCD，支持 ASCII、binary、binary_compressed（LZF），支持中文路径。
 - 使用 PCA 多姿态初始化与 ICP 将 B 刚体配准到 A，显示几何相似度、双向重合率、RMSE，红色/紫色标记两侧差异点。
 - 独立对 A/B 进行单圆柱重建，显示半径、直径、轴线、长度、拟合误差及内点率，黄色线框显示圆柱侧面，绿色/红色标记圆柱内外点。
+- 圆柱重建后计算最大直径、点云长度、最小截面长度、最小截面直径、最大截面椭圆率、最大截面轴心位置偏差，以及两根轴线夹角。各项测量可单独叠加到点云视图。
 - 导出配准后的点云、差异点、4×4 变换矩阵，以及圆柱 OBJ 网格、表面 PCD、内外点 PCD 和参数报告。
 - 后台读取、计算和导出，可取消任务；重新加载文件会清除相关旧结果。
 
@@ -223,7 +224,135 @@ void writeCloud(const std::filesystem::path& file,const std::vector<Vec3>& point
     for(size_t i=0;i<points.size();++i){if(i%1024==0)cancelled(cancel);if(!mask||(((*mask)[i]!=0)==inside))out<<points[i].x<<' '<<points[i].y<<' '<<points[i].z<<'\n';}
     require(bool(out),"Failed to write cylinder PCD.");
 }
+struct SectionPoint {
+    double x, y;
+};
+long double cross2(SectionPoint a, SectionPoint b, SectionPoint c) {
+    const long double dx=b.x-a.x,dy=b.y-a.y;
+    return dx*(c.y-a.y)-dy*(c.x-a.x);
+}
+std::vector<SectionPoint> convexHull(std::vector<SectionPoint>& points) {
+    std::sort(points.begin(),points.end(),[](SectionPoint a,SectionPoint b) {
+        return a.x<b.x||(a.x==b.x&&a.y<b.y);
+    });
+    std::vector<SectionPoint> hull;
+    const auto append=[&](SectionPoint p,size_t start) {
+        while(hull.size()>=start+2&&cross2(hull[hull.size()-2],hull.back(),p)<=0)
+            hull.pop_back();
+        hull.push_back(p);
+    };
+    for(auto p:points)append(p,0);
+    const auto upperStart=hull.size()-1;
+    for(auto it=points.rbegin()+1;it!=points.rend();++it)append(*it,upperStart);
+    hull.pop_back();
+    return hull;
+}
+bool measureSection(std::vector<SectionPoint>& points,Vec3 origin,Vec3 u,Vec3 v,Section& out) {
+    if(points.size()<24)return false;
+    std::vector<double> angles;
+    angles.reserve(points.size());
+    for(auto p:points)angles.push_back(std::atan2(p.y,p.x));
+    std::sort(angles.begin(),angles.end());
+    if(angles.front()+2*Pi-angles.back()>Pi/3)return false;
+    for(size_t i=1;i<angles.size();++i)
+        if(angles[i]-angles[i-1]>Pi/3)return false;
+
+    const auto hull=convexHull(points);
+    const size_t n=hull.size();
+    if(n<3)return false;
+    const auto world=[&](SectionPoint p){return origin+u*p.x+v*p.y;};
+    double twiceArea=0,cx=0,cy=0,diameterSquared=0;
+    out.minWidth=std::numeric_limits<double>::infinity();
+    size_t opposite=1;
+    const auto testDiameter=[&](SectionPoint a,SectionPoint b) {
+        const double dx=b.x-a.x,dy=b.y-a.y,d2=dx*dx+dy*dy;
+        if(d2>diameterSquared){diameterSquared=d2;out.diameter={world(a),world(b)};}
+    };
+    // The opposite support point advances monotonically around a convex polygon.
+    for(size_t i=0;i<n;++i) {
+        const auto a=hull[i],b=hull[(i+1)%n];
+        const auto height=[&](size_t j){return cross2(a,b,hull[j]);};
+        const long double dx=b.x-a.x,dy=b.y-a.y;
+        const auto step=[&](size_t j) {
+            const auto p=hull[j],q=hull[(j+1)%n];
+            return dx*(q.y-p.y)-dy*(q.x-p.x);
+        };
+        if(i==0) {
+            for(size_t j=0;j<n;++j)if(height(j)>height(opposite))opposite=j;
+        }
+        for(size_t j=0;j+1<n&&step(opposite)>=0;++j) {
+            if(step(opposite)==0) {
+                testDiameter(a,hull[opposite]);testDiameter(b,hull[opposite]);
+            }
+            opposite=(opposite+1)%n;
+        }
+        const auto p=hull[opposite];
+        testDiameter(a,p);testDiameter(b,p);
+        const double edge=std::hypot(static_cast<double>(dx),static_cast<double>(dy));
+        const double width=static_cast<double>(height(opposite))/edge;
+        if(width<out.minWidth) {
+            out.minWidth=width;
+            out.width={world({p.x+static_cast<double>(dy)/edge*width,p.y-static_cast<double>(dx)/edge*width}),world(p)};
+        }
+        const double area=a.x*b.y-b.x*a.y;
+        twiceArea+=area;cx+=(a.x+b.x)*area;cy+=(a.y+b.y)*area;
+    }
+    if(twiceArea<=0||diameterSquared<=0)return false;
+    out.axisPoint=origin;
+    out.center=world({cx/(3*twiceArea),cy/(3*twiceArea)});
+    out.offset=std::sqrt(norm2(out.center-origin));
+    out.maxDiameter=std::sqrt(diameterSquared);
+    out.equivalentDiameter=2*std::sqrt(twiceArea/(2*Pi));
+    out.ellipticity=100*(1-out.minWidth/out.maxDiameter);
+    return true;
+}
+CylinderMeasurements measureCylinder(const Cloud& cloud,const Cylinder& model,Vec3 u,Vec3 v,
+    const std::atomic_bool* cancel) {
+    constexpr size_t count=20;
+    std::array<std::vector<SectionPoint>,count> sections;
+    double lo=std::numeric_limits<double>::infinity(),hi=-lo;
+    for(size_t i=0;i<cloud.points.size();++i) {
+        if(i%2048==0)cancelled(cancel);
+        if(!model.inliers[i])continue;
+        const Vec3 p=cloud.points[i]-model.center;
+        const double z=dot(p,model.axis);
+        lo=std::min(lo,z);hi=std::max(hi,z);
+        const double relative=std::clamp(z/model.height+0.5,0.0,1.0);
+        const size_t bin=std::min(count-1,static_cast<size_t>(relative*count));
+        sections[bin].push_back({dot(p,u),dot(p,v)});
+    }
+    CylinderMeasurements m;
+    m.length=hi-lo;
+    m.lengthLine={model.center+model.axis*lo,model.center+model.axis*hi};
+    for(size_t i=0;i<count;++i) {
+        cancelled(cancel);
+        const Vec3 origin=model.center+model.axis*(model.height*((i+0.5)/count-0.5));
+        Section s;
+        if(!measureSection(sections[i],origin,u,v,s))continue;
+        const bool first=m.validSections++==0;
+        if(first||s.maxDiameter>m.maxDiameter.maxDiameter)m.maxDiameter=s;
+        if(first||s.minWidth<m.minWidth.minWidth)m.minWidth=s;
+        if(first||s.equivalentDiameter<m.minDiameter.equivalentDiameter)m.minDiameter=s;
+        if(first||s.ellipticity>m.maxEllipticity.ellipticity)m.maxEllipticity=s;
+    }
+    cancelled(cancel);
+    return m;
+}
 } // namespace
+
+AxisAngle measureAxisAngle(const Cylinder& a,const Cylinder& b,const Transform* bToA) {
+    Vec3 direction=b.axis;
+    if(bToA) {
+        const auto& r=bToA->r;
+        direction={r[0]*b.axis.x+r[1]*b.axis.y+r[2]*b.axis.z,
+                   r[3]*b.axis.x+r[4]*b.axis.y+r[5]*b.axis.z,
+                   r[6]*b.axis.x+r[7]*b.axis.y+r[8]*b.axis.z};
+    }
+    if(dot(a.axis,direction)<0)direction=direction*(-1);
+    return {a.axis,direction,std::atan2(std::sqrt(norm2(cross(a.axis,direction))),
+        dot(a.axis,direction))*180/Pi};
+}
+
 Cylinder reconstructCylinder(const Cloud& cloud,double distanceThreshold,const std::atomic_bool* cancel,Progress progress) {
     require(cloud.points.size()>=30,"Cylinder reconstruction requires at least 30 finite points.");
     require(std::isfinite(distanceThreshold)&&distanceThreshold>=0,"Cylinder tolerance must be finite and nonnegative.");
@@ -297,6 +426,8 @@ Cylinder reconstructCylinder(const Cloud& cloud,double distanceThreshold,const s
     out.inlierRatio=static_cast<double>(count)/static_cast<double>(cloud.points.size());
     require(count>=30&&out.inlierRatio>=0.5,"Cylinder support insufficient after axial trimming.");
     out.rmse=std::sqrt(error/static_cast<double>(count));
+    if(progress)progress("Cylinder: measuring observed cross-sections...");
+    out.measurements=measureCylinder(cloud,out,u,v,cancel);
     const size_t rings=25,segments=64;
     for(size_t h=0;h<rings;++h)for(size_t a=0;a<segments;++a) {
         double angle=2*Pi*static_cast<double>(a)/segments;
@@ -327,6 +458,16 @@ void exportCylinder(const std::filesystem::path& dir,const Cloud& source,const C
         <<"\nDistance_threshold="<<model.threshold<<"\nInlier_ratio="<<model.inlierRatio<<"\nRadial_RMSE="<<model.rmse
         <<"\nObserved_arc_degrees="<<model.angularCoverage*180/Pi
         <<"\nOpen-ended full 360-degree analytical side surface; end caps and unobserved areas are not measured.\n";
+    const auto& m=model.measurements;
+    report<<"Point_cloud_length="<<m.length<<"\nValid_sections="<<m.validSections<<"/20\n";
+    if(m.validSections) {
+        const auto& s=m.maxDiameter;
+        report<<"Max_diameter="<<s.maxDiameter<<"\nMin_section_width="<<m.minWidth.minWidth
+              <<"\nMin_section_equivalent_diameter="<<m.minDiameter.equivalentDiameter
+              <<"\nMax_section_ellipticity_percent="<<m.maxEllipticity.ellipticity
+              <<"\nLargest_section_center="<<s.center.x<<' '<<s.center.y<<' '<<s.center.z
+              <<"\nLargest_section_axis_offset="<<s.offset<<'\n';
+    }
     require(bool(report),"Failed to write cylinder report.");
 }
 }
@@ -337,14 +478,33 @@ Write-BundleFile 'VC2019/PointCloudWorkbench/Cylinder.h' @'
 #include "PointCloud.h"
 
 namespace pc {
+struct Segment { Vec3 from, to; };
+struct Section {
+    Vec3 center, axisPoint;
+    Segment diameter, width;
+    double maxDiameter=0, minWidth=0, equivalentDiameter=0, ellipticity=0, offset=0;
+};
+struct CylinderMeasurements {
+    Segment lengthLine;
+    double length=0;
+    size_t validSections=0;
+    Section maxDiameter, minWidth, minDiameter, maxEllipticity;
+};
 struct Cylinder {
     Vec3 center;       // Midpoint of the reconstructed finite axis segment.
     Vec3 axis;         // Unit vector in the input cloud's coordinates.
     double radius=0, height=0, threshold=0, rmse=0, inlierRatio=0, angularCoverage=0;
     std::vector<unsigned char> inliers; // One entry per original valid point.
+    CylinderMeasurements measurements;
     std::vector<Vec3> vertices;
     std::vector<std::array<size_t,3>> triangles;
 };
+struct AxisAngle {
+    Vec3 directionA, directionB;
+    double degrees=0;
+};
+AxisAngle measureAxisAngle(const Cylinder& a, const Cylinder& b,
+    const Transform* bToA=nullptr);
 Cylinder reconstructCylinder(const Cloud& cloud, double distanceThreshold=0,
     const std::atomic_bool* cancel=nullptr, Progress progress={});
 void exportCylinder(const std::filesystem::path& directory, const Cloud& source,
@@ -818,7 +978,7 @@ LANGUAGE LANG_CHINESE, SUBLANG_CHINESE_SIMPLIFIED
 IDD_MAIN_DIALOG DIALOGEX 0, 0, 740, 540
 STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_CLIPCHILDREN
 EXSTYLE WS_EX_APPWINDOW
-CAPTION "PCD 点云工作台 — 配准、差异分析与圆柱重建"
+CAPTION "PCD 点云工作台 — 配准、差异分析、圆柱重建与测量"
 FONT 9, "Microsoft YaHei UI"
 BEGIN
     PUSHBUTTON "读取点云 A", IDC_OPEN_A, 8, 8, 68, 20
@@ -842,7 +1002,10 @@ BEGIN
     AUTOCHECKBOX "显示 B 原始位置", IDC_ORIGINAL, 8, 94, 112, 16
     AUTOCHECKBOX "仅显示配准差异点", IDC_DIFF_ONLY, 130, 94, 108, 16
     LTEXT "青=A  绿=B  红/紫=差异  黄=圆柱 | 左键旋转，右键平移，滚轮缩放", IDC_HINT, 246, 96, 486, 14
-    CONTROL "", IDC_VIEW, "PointCloudView", WS_CHILD | WS_VISIBLE | WS_BORDER, 8, 116, 724, 300
+    LTEXT "测量叠加", -1, 8, 122, 50, 12
+    COMBOBOX IDC_MEASURE_OVERLAY, 60, 117, 158, 140, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT "圆柱重建后可查看测量 | 粉=A 浅蓝=B | 轴线夹角需要两份圆柱", -1, 226, 122, 506, 14
+    CONTROL "", IDC_VIEW, "PointCloudView", WS_CHILD | WS_VISIBLE | WS_BORDER, 8, 146, 724, 270
     EDITTEXT IDC_RESULTS, 8, 422, 724, 84, ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL
     LTEXT "读取 PCD 后可配准比较，或对单份点云进行圆柱重建。", IDC_STATUS, 8, 514, 724, 16, SS_ENDELLIPSIS
 END
@@ -998,7 +1161,7 @@ Write-BundleFile 'VC2019/PointCloudWorkbench/README.md' @'
 
 ## 示例
 
-完整 ZIP 的 `samples` 目录有三份点云。先用 `sample_A.pcd` 和 `sample_B_rigid.pcd`，阈值设为 `0.02`，应得到约 100% 相似度；再将 B 换为 `sample_B_changed.pcd` 观察差异点。文件路径由用户通过读取按钮选择。
+完整 ZIP 的 `samples` 目录有配准和圆柱示例。先用 `sample_A.pcd` 和 `sample_B_rigid.pcd`，阈值设为 `0.02`，应得到约 100% 相似度；再将 B 换为 `sample_B_changed.pcd` 观察差异点。文件路径由用户通过读取按钮选择。
 
 ## 圆柱重建
 
@@ -1028,7 +1191,25 @@ Write-BundleFile 'VC2019/PointCloudWorkbench/README.md' @'
 
 随包 `samples/cylinder_A_noisy.pcd` 和 `cylinder_partial.pcd` 可直接测试，真实半径均为 0.7，推荐圆柱距离阈值 `0.012`。`cylinder_B_rigid.pcd` 用于同时测试配准和双圆柱显示。
 
+## 点云测量
+
+点击“圆柱重建 A”或“圆柱重建 B”同时计算该点云的尺寸。结果框可滚动。使用“测量叠加”下拉框隐藏、单独显示或同时显示各项测量，粉色代表 A，浅蓝代表 B。叠加标签 L、Dmax、Wmin、Deq、E、Offset 分别对应长度、最大直径、最小截面长度、最小截面直径、椭圆率、轴心偏差，A/B 标签的单位 deg 表示度。轴线夹角使用两条共起点的方向线和白色夹角弧。测量图形随视图旋转、平移和缩放，并跟随 B 的配准状态。
+
+| 指标 | 计算口径与叠加 |
+| --- | --- |
+| 最大直径 | 所有有效截面中最大的凸包点对距离，叠加两端点和直径线。 |
+| 点云长度 | 圆柱内点投影至拟合轴后的最大与最小位置之差，叠加轴向端点。与模型的 1%/99% 分位重建长度有区别。 |
+| 最小截面长度 | 所有有效截面的最小卡尺宽度，即平行支撑线间的最小距离，叠加宽度线。 |
+| 最小截面直径 | 所有有效截面的最小等面积圆直径，公式为 `2 × sqrt(凸包面积 / π)`，叠加等面积圆。 |
+| 最大截面椭圆率 | 有效截面中最大的 `100 × (1 − 最小卡尺宽度 / 最大直径)`，叠加该截面的直径线与宽度线。 |
+| 最大截面轴心位置偏差 | 取最大直径对应的截面，计算截面凸包面积质心到拟合轴的距离，叠加两者连线。结果框同时列出截面质心坐标。 |
+| 轴线夹角 | A、B 均完成圆柱重建后，计算两条无朝向轴线的最小夹角，范围 0°–90°。“显示 B 原始位置”在原始坐标与配准后坐标之间切换。 |
+
+每个圆柱用轴向 20 个等厚区间分组，将区间内的原始圆柱内点投影至区间中心平面。截面至少需要 24 个内点，且相邻采样方向的最大角间隙不超过 60°。覆盖不足时跳过该截面；没有有效截面时仍显示点云长度。截面尺寸来自观测点形成的凸包，部分圆弧不会用解析圆柱外推补齐。离群点、圆柱拟合容差、截面厚度和采样密度会影响尺寸估计。长度、直径和偏差沿用 PCD 坐标单位。圆柱导出报告包含各单云测量值及原始坐标系中的截面质心。
+
 ## 验证
+
+- 截面测量用完整圆柱、有局部扩大和偏心的椭圆截面、覆盖不足的局部圆弧及带旋转/平移的双轴夹角验证。
 
 - Linux 原生 C++17 测试覆盖 PCD 三种编码、额外字段、LZF 回溯、NaN 过滤、坏文件、取消操作、同云、旋转平移、8 组三维旋转、噪声、部分重叠、差异点和导出回读。
 - 新增完整圆柱+离群点、短粗圆柱、部分圆弧、大坐标、384000 点有序扫描、平面/球面/直线/窄圆弧拒绝、取消以及 OBJ/PCD 导出测试。
@@ -1071,7 +1252,7 @@ Write-BundleFile 'VC2019/PointCloudWorkbench/main.cpp' @'
 constexpr UINT WM_WORK_DONE = WM_APP + 1;
 constexpr UINT WM_WORK_STATUS = WM_APP + 2;
 struct View {
-    HDC dc=nullptr; HGLRC context=nullptr;
+    HDC dc=nullptr; HGLRC context=nullptr; GLuint fontLists=0;
     double yaw=-25,pitch=20,zoom=1,panX=0,panY=0,radius=1;
     pc::Vec3 center;
     POINT mouse{}; bool left=false,right=false;
@@ -1186,6 +1367,103 @@ static void DrawCylinderLabels(App& app,const pc::Cloud& cloud,const pc::Cylinde
     }
     glEnd();
 }
+static const pc::Transform* DisplayAlignment(const App& app) {
+    return app.hasResult&&IsDlgButtonChecked(app.dialog,IDC_ORIGINAL)!=BST_CHECKED
+        ?&app.result.bToA:nullptr;
+}
+enum MeasureOverlay { Hidden, All, Diameter, Length, Width, Equivalent, Ellipticity, Offset, Angle };
+static void DrawMeasureValue(const App& app,pc::Vec3 p,const char* name,double value,int row,const char* unit="") {
+    if(!app.view.fontLists)return;
+    std::ostringstream label;
+    label<<name<<' '<<std::setprecision(6)<<value<<unit;
+    const auto text=label.str();
+    glRasterPos3d(p.x,p.y,p.z);
+    glBitmap(0,0,0,0,6,5+row*14.0f,nullptr);
+    glListBase(app.view.fontLists);
+    glCallLists(static_cast<GLsizei>(text.size()),GL_UNSIGNED_BYTE,text.data());
+}
+static void DrawMeasurements(App& app,int selected) {
+    if(selected<=Hidden)return;
+    glDisable(GL_DEPTH_TEST);
+    glLineWidth(2);
+    const auto show=[&](int metric){return selected==All||selected==metric;};
+    for(bool b:{false,true}) {
+        if(!(b?app.hasCylinderB:app.hasCylinderA))continue;
+        const auto& c=b?app.cylinderB:app.cylinderA;
+        const auto& m=c.measurements;
+        const auto vertex=[&](pc::Vec3 p){
+            p=DisplayPoint(app,p,b);glVertex3d(p.x,p.y,p.z);
+        };
+        const auto line=[&](pc::Segment s){
+            glBegin(GL_LINES);vertex(s.from);vertex(s.to);glEnd();
+            glPointSize(6);glBegin(GL_POINTS);vertex(s.from);vertex(s.to);glEnd();
+        };
+        const auto label=[&](pc::Vec3 p,const char* name,double value,int row,const char* unit=""){
+            const std::string caption=std::string(b?"B ":"A ")+name;
+            DrawMeasureValue(app,DisplayPoint(app,p,b),caption.c_str(),value,selected==All?row:0,unit);
+        };
+        glColor3f(b?0.45f:1.0f,b?0.80f:0.46f,b?1.0f:0.78f);
+        if(show(Length)) {
+            line(m.lengthLine);
+            label(m.lengthLine.to,"L",m.length,0);
+        }
+        if(!m.validSections)continue;
+        if(show(Diameter)) {
+            line(m.maxDiameter.diameter);
+            label(m.maxDiameter.diameter.to,"Dmax",m.maxDiameter.maxDiameter,1);
+        }
+        if(show(Width)) {
+            line(m.minWidth.width);
+            label(m.minWidth.width.to,"Wmin",m.minWidth.minWidth,2);
+        }
+        if(show(Equivalent)) {
+            const auto& s=m.minDiameter;
+            const auto d=s.diameter.to-s.diameter.from;
+            const auto u=d*(1/std::sqrt(pc::norm2(d)));
+            const pc::Vec3 v{c.axis.y*u.z-c.axis.z*u.y,c.axis.z*u.x-c.axis.x*u.z,c.axis.x*u.y-c.axis.y*u.x};
+            glBegin(GL_LINE_LOOP);
+            for(int i=0;i<64;++i) {
+                const double angle=6.283185307179586*i/64;
+                vertex(s.center+(u*std::cos(angle)+v*std::sin(angle))*(s.equivalentDiameter*0.5));
+            }
+            glEnd();
+            label(s.center,"Deq",s.equivalentDiameter,3);
+        }
+        if(show(Ellipticity)) {
+            const auto& s=m.maxEllipticity;
+            line(s.diameter);line(s.width);
+            label(s.center,"E",s.ellipticity,4,"%");
+        }
+        if(show(Offset)) {
+            const auto& s=m.maxDiameter;
+            line({s.axisPoint,s.center});
+            label(s.center,"Offset",s.offset,5);
+        }
+    }
+    if(show(Angle)&&app.hasCylinderA&&app.hasCylinderB) {
+        const auto& a=app.cylinderA;
+        const auto angle=pc::measureAxisAngle(a,app.cylinderB,DisplayAlignment(app));
+        const double length=std::max(a.height*0.45,a.radius);
+        const auto vertex=[&](pc::Vec3 direction,double scale){
+            const auto p=a.center+direction*scale-app.view.center;glVertex3d(p.x,p.y,p.z);
+        };
+        glBegin(GL_LINES);
+        glColor3f(1,0.46f,0.78f);vertex({},0);vertex(angle.directionA,length);
+        glColor3f(0.45f,0.8f,1);vertex({},0);vertex(angle.directionB,length);
+        glEnd();
+        glColor3f(1,1,1);glBegin(GL_LINE_STRIP);
+        for(int i=0;i<=32;++i) {
+            const double f=i/32.0;
+            const auto d=angle.directionA*(1-f)+angle.directionB*f;
+            vertex(d,length*0.55/std::sqrt(pc::norm2(d)));
+        }
+        glEnd();
+        const auto bisector=angle.directionA+angle.directionB;
+        DrawMeasureValue(app,a.center+bisector*(length*0.55/std::sqrt(pc::norm2(bisector)))-app.view.center,
+            "A/B",angle.degrees,0," deg");
+    }
+    glLineWidth(1);glEnable(GL_DEPTH_TEST);
+}
 static void Paint(HWND window) {
     PAINTSTRUCT ps{};BeginPaint(window,&ps);
     auto* app=GetApp(GetParent(window));
@@ -1214,6 +1492,7 @@ static void Paint(HWND window) {
         if(app->hasCylinderA)DrawCylinder(*app,app->cylinderA,false);
         if(app->hasCylinderB)DrawCylinder(*app,app->cylinderB,true);
     }
+    DrawMeasurements(*app,static_cast<int>(SendDlgItemMessageW(app->dialog,IDC_MEASURE_OVERLAY,CB_GETCURSEL,0,0)));
     SwapBuffers(v.dc);EndPaint(window,&ps);
 }
 static LRESULT CALLBACK ViewProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
@@ -1253,7 +1532,7 @@ static LRESULT CALLBACK ViewProc(HWND window,UINT message,WPARAM wParam,LPARAM l
 static void Layout(HWND dialog) {
     RECT r{};GetClientRect(dialog,&r);int width=r.right,height=r.bottom;
     // Top controls retain font-scaled resource positions; the view and report stretch.
-    RECT top{0,0,8,116};MapDialogRect(dialog,&top);
+    RECT top{0,0,8,146};MapDialogRect(dialog,&top);
     RECT report{0,0,0,84};MapDialogRect(dialog,&report);
     RECT status{0,0,0,18};MapDialogRect(dialog,&status);
     int margin=top.right,viewTop=top.bottom,content=std::max(0,width-2*margin);
@@ -1275,7 +1554,15 @@ static bool InitGL(App& app) {
     int format=ChoosePixelFormat(app.view.dc,&pfd);
     if(!format||!SetPixelFormat(app.view.dc,format,&pfd)) return false;
     app.view.context=wglCreateContext(app.view.dc);
-    return app.view.context&&wglMakeCurrent(app.view.dc,app.view.context);
+    if(!app.view.context||!wglMakeCurrent(app.view.dc,app.view.context))return false;
+    const GLuint lists=glGenLists(127);
+    if(lists) {
+        const auto oldFont=SelectObject(app.view.dc,GetStockObject(ANSI_FIXED_FONT));
+        if(wglUseFontBitmapsW(app.view.dc,32,95,lists+32))app.view.fontLists=lists;
+        else glDeleteLists(lists,127);
+        if(oldFont)SelectObject(app.view.dc,oldFont);
+    }
+    return true;
 }
 static void Launch(App& app,int action,const std::filesystem::path& path={},double threshold=0) {
     app.cancel=false;Busy(app,true);Status(app,L"正在处理，可点击“取消计算”停止……");
@@ -1326,9 +1613,28 @@ static void ResultsText(App& app) {
            <<L"，重建长度="<<c.height<<L"，径向 RMSE="<<c.rmse<<L"，内点率="<<std::setprecision(2)<<100*c.inlierRatio<<L"%"
            <<L"\r\n轴方向=("<<std::setprecision(5)<<c.axis.x<<L", "<<c.axis.y<<L", "<<c.axis.z
            <<L")，阈值="<<c.threshold<<L"，原始坐标系。黄色模型为完整圆周外推的开口侧面。";
+        const auto& m=c.measurements;
+        out<<std::setprecision(6)<<L"\r\n测量 "<<(b?L"B":L"A")<<L"：点云长度="<<m.length
+           <<L"，有效截面="<<m.validSections<<L"/20";
+        if(m.validSections) {
+            const auto& largest=m.maxDiameter;
+            out<<L"\r\n最大直径="<<largest.maxDiameter<<L"，最小截面长度="<<m.minWidth.minWidth
+               <<L"，最小截面直径="<<m.minDiameter.equivalentDiameter
+               <<L"，最大截面椭圆率="<<m.maxEllipticity.ellipticity<<L"%"
+               <<L"\r\n最大截面轴心位置偏差="<<largest.offset;
+            const auto center=b&&DisplayAlignment(app)?app.result.bToA.apply(largest.center):largest.center;
+            out<<L"，轴心=("<<center.x<<L", "<<center.y<<L", "<<center.z<<L")";
+        } else out<<L"；截面取样覆盖不足，截面测量不可用。";
+    }
+    if(app.hasCylinderA&&app.hasCylinderB) {
+        const auto* alignment=DisplayAlignment(app);
+        const auto angle=pc::measureAxisAngle(app.cylinderA,app.cylinderB,alignment);
+        out<<L"\r\nA/B 轴线夹角="<<std::setprecision(6)<<angle.degrees
+           <<L"°（"<<(alignment?L"配准后":L"原始位置")<<L"）";
     }
     if(!app.hasResult&&!app.hasCylinderA&&!app.hasCylinderB)out<<L"读取完成。可配准比较，或对 A/B 进行单圆柱重建。";
     SetDlgItemTextW(app.dialog,IDC_RESULTS,out.str().c_str());
+    SendDlgItemMessageW(app.dialog,IDC_RESULTS,EM_SETSEL,0,0);
 }
 static void Finish(App& app,std::unique_ptr<WorkResult> work) {
     if(app.worker.joinable()) app.worker.join();
@@ -1388,6 +1694,10 @@ static INT_PTR CALLBACK DialogProc(HWND dialog,UINT message,WPARAM wParam,LPARAM
         app=reinterpret_cast<App*>(lParam);app->dialog=dialog;
         SetWindowLongPtrW(dialog,DWLP_USER,reinterpret_cast<LONG_PTR>(app));
         SetDlgItemTextW(dialog,IDC_THRESHOLD,L"0");SetDlgItemTextW(dialog,IDC_CYL_THRESHOLD,L"0");
+        for(const wchar_t* label:{L"隐藏测量",L"全部测量",L"最大直径",L"点云长度",
+            L"最小截面长度",L"最小截面直径",L"最大截面椭圆率",L"最大截面轴心位置偏差",L"A/B 轴线夹角"})
+            SendDlgItemMessageW(dialog,IDC_MEASURE_OVERLAY,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(label));
+        SendDlgItemMessageW(dialog,IDC_MEASURE_OVERLAY,CB_SETCURSEL,0,0);
         CheckDlgButton(dialog,IDC_CYL_SHOW,BST_CHECKED);Busy(*app,false);Layout(dialog);
         if(!InitGL(*app)) {MessageBoxW(dialog,L"无法初始化 OpenGL，请检查显卡驱动或远程桌面的 OpenGL 支持。",L"启动失败",MB_OK|MB_ICONERROR);EndDialog(dialog,1);}
         else Refresh(*app);
@@ -1395,7 +1705,7 @@ static INT_PTR CALLBACK DialogProc(HWND dialog,UINT message,WPARAM wParam,LPARAM
     case WM_SIZE:if(app&&wParam!=SIZE_MINIMIZED) Layout(dialog);return TRUE;
     case WM_GETMINMAXINFO: {
         // Resource toolbar must remain usable. No custom maximum size.
-        RECT rect{0,0,736,350};MapDialogRect(dialog,&rect);
+        RECT rect{0,0,736,380};MapDialogRect(dialog,&rect);
         AdjustWindowRectEx(&rect,static_cast<DWORD>(GetWindowLongPtrW(dialog,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongPtrW(dialog,GWL_EXSTYLE)));
         auto* limits=reinterpret_cast<MINMAXINFO*>(lParam);
         limits->ptMinTrackSize={rect.right-rect.left,rect.bottom-rect.top};return TRUE;
@@ -1429,7 +1739,10 @@ static INT_PTR CALLBACK DialogProc(HWND dialog,UINT message,WPARAM wParam,LPARAM
                 CheckDlgButton(dialog,IDC_DIFF_ONLY,BST_UNCHECKED);
             Refresh(*app);return TRUE;
         case IDC_FIT:if(!app->busy) FitView(*app);return TRUE;
-        case IDC_ORIGINAL:FitView(*app);return TRUE;
+        case IDC_MEASURE_OVERLAY:
+            if(HIWORD(wParam)==CBN_SELCHANGE)Refresh(*app);
+            return TRUE;
+        case IDC_ORIGINAL:ResultsText(*app);FitView(*app);return TRUE;
         case IDC_DIFF_ONLY:
             if(IsDlgButtonChecked(dialog,IDC_DIFF_ONLY)==BST_CHECKED)CheckDlgButton(dialog,IDC_CYL_LABELS,BST_UNCHECKED);
             Refresh(*app);return TRUE;
@@ -1487,6 +1800,7 @@ Write-BundleFile 'VC2019/PointCloudWorkbench/resource.h' @'
 #define IDC_CYL_THRESHOLD 1020
 #define IDC_CYL_SHOW 1021
 #define IDC_CYL_LABELS 1022
+#define IDC_MEASURE_OVERLAY 1023
 '@
 
 Write-BundleFile 'samples/README.md' @'
@@ -11159,6 +11473,38 @@ int main(int argc,char** argv){
         organized.points.push_back({0.7*std::cos(angle),0.7*std::sin(angle),3.0*h/5999});}
     auto ordered=pc::reconstructCylinder(organized,0.006);
     expect(std::abs(ordered.radius-0.7)<0.001&&std::abs(ordered.axis.z)>0.999,"Organized ring scan sampling");
+    const auto& round=ordered.measurements;
+    expect(round.validSections==20&&std::abs(round.length-ordered.height)<0.013,"Round measurement coverage and length");
+    expect(std::abs(round.maxDiameter.maxDiameter-1.4)<0.002,"Maximum diameter");
+    expect(std::abs(round.minWidth.minWidth-1.4*std::cos(3.141592653589793/64))<0.002,"Minimum caliper width");
+    expect(std::abs(round.minDiameter.equivalentDiameter-1.4)<0.003,"Minimum area-equivalent diameter");
+    expect(round.maxEllipticity.ellipticity<0.4&&round.maxDiameter.offset<0.002,"Round ellipticity and axis offset");
+    expect(partial.measurements.validSections==0&&partial.measurements.length>2.8,"Incomplete arc only supports length");
+
+    pc::Cloud oval;
+    for(int h=0;h<41;++h)for(int k=0;k<96;++k) {
+        const double angle=6.283185307179586*k/96;
+        const double axial=(h-20)*0.1;
+        const bool bulge=std::abs(axial)<0.21;
+        oval.points.push_back({(bulge?0.79:0.73)*std::cos(angle)+(bulge?0.04:0),
+                              0.67*std::sin(angle),axial});
+    }
+    const auto deformed=pc::reconstructCylinder(oval,0.15);
+    const auto& dimensions=deformed.measurements;
+    expect(dimensions.validSections==20&&dimensions.length>3.9,"Oval coverage and length");
+    expect(std::abs(dimensions.maxDiameter.maxDiameter-1.58)<0.07,"Oval largest diameter");
+    expect(std::abs(dimensions.minWidth.minWidth-1.34)<0.035,"Oval minimum caliper width");
+    expect(std::abs(dimensions.minDiameter.equivalentDiameter-2*std::sqrt(0.73*0.67))<0.025,"Oval minimum equivalent diameter");
+    expect(dimensions.maxEllipticity.ellipticity>12&&dimensions.maxEllipticity.ellipticity<24,"Oval ellipticity");
+    expect(dimensions.maxDiameter.offset>0.02&&dimensions.maxDiameter.offset<0.08,"Local section center offset");
+
+    pc::Cylinder first,second;
+    first.axis={0,0,1};second.axis={-0.5,0,-std::sqrt(0.75)};
+    expect(std::abs(pc::measureAxisAngle(first,second).degrees-30)<1e-9,"Unsigned native axis angle");
+    pc::Transform transform;
+    transform.r={std::sqrt(0.75),0,-0.5,0,1,0,0.5,0,std::sqrt(0.75)};
+    transform.t={100,-200,300};
+    expect(pc::measureAxisAngle(first,second,&transform).degrees<1e-9,"Aligned axis angle ignores translation");
     auto autoResult=pc::reconstructCylinder(cylinder(0.7,3));expect(autoResult.inlierRatio>0.95,"Automatic threshold");
     auto moved=cylinder(0.7,3);for(auto& p:moved.points)p=p+pc::Vec3{1e6,-1e6,1e6};
     auto distant=pc::reconstructCylinder(moved,0.012);expect(std::abs(distant.radius-0.7)<0.01,"Large world offset");

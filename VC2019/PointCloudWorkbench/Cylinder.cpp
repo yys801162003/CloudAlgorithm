@@ -127,7 +127,135 @@ void writeCloud(const std::filesystem::path& file,const std::vector<Vec3>& point
     for(size_t i=0;i<points.size();++i){if(i%1024==0)cancelled(cancel);if(!mask||(((*mask)[i]!=0)==inside))out<<points[i].x<<' '<<points[i].y<<' '<<points[i].z<<'\n';}
     require(bool(out),"Failed to write cylinder PCD.");
 }
+struct SectionPoint {
+    double x, y;
+};
+long double cross2(SectionPoint a, SectionPoint b, SectionPoint c) {
+    const long double dx=b.x-a.x,dy=b.y-a.y;
+    return dx*(c.y-a.y)-dy*(c.x-a.x);
+}
+std::vector<SectionPoint> convexHull(std::vector<SectionPoint>& points) {
+    std::sort(points.begin(),points.end(),[](SectionPoint a,SectionPoint b) {
+        return a.x<b.x||(a.x==b.x&&a.y<b.y);
+    });
+    std::vector<SectionPoint> hull;
+    const auto append=[&](SectionPoint p,size_t start) {
+        while(hull.size()>=start+2&&cross2(hull[hull.size()-2],hull.back(),p)<=0)
+            hull.pop_back();
+        hull.push_back(p);
+    };
+    for(auto p:points)append(p,0);
+    const auto upperStart=hull.size()-1;
+    for(auto it=points.rbegin()+1;it!=points.rend();++it)append(*it,upperStart);
+    hull.pop_back();
+    return hull;
+}
+bool measureSection(std::vector<SectionPoint>& points,Vec3 origin,Vec3 u,Vec3 v,Section& out) {
+    if(points.size()<24)return false;
+    std::vector<double> angles;
+    angles.reserve(points.size());
+    for(auto p:points)angles.push_back(std::atan2(p.y,p.x));
+    std::sort(angles.begin(),angles.end());
+    if(angles.front()+2*Pi-angles.back()>Pi/3)return false;
+    for(size_t i=1;i<angles.size();++i)
+        if(angles[i]-angles[i-1]>Pi/3)return false;
+
+    const auto hull=convexHull(points);
+    const size_t n=hull.size();
+    if(n<3)return false;
+    const auto world=[&](SectionPoint p){return origin+u*p.x+v*p.y;};
+    double twiceArea=0,cx=0,cy=0,diameterSquared=0;
+    out.minWidth=std::numeric_limits<double>::infinity();
+    size_t opposite=1;
+    const auto testDiameter=[&](SectionPoint a,SectionPoint b) {
+        const double dx=b.x-a.x,dy=b.y-a.y,d2=dx*dx+dy*dy;
+        if(d2>diameterSquared){diameterSquared=d2;out.diameter={world(a),world(b)};}
+    };
+    // The opposite support point advances monotonically around a convex polygon.
+    for(size_t i=0;i<n;++i) {
+        const auto a=hull[i],b=hull[(i+1)%n];
+        const auto height=[&](size_t j){return cross2(a,b,hull[j]);};
+        const long double dx=b.x-a.x,dy=b.y-a.y;
+        const auto step=[&](size_t j) {
+            const auto p=hull[j],q=hull[(j+1)%n];
+            return dx*(q.y-p.y)-dy*(q.x-p.x);
+        };
+        if(i==0) {
+            for(size_t j=0;j<n;++j)if(height(j)>height(opposite))opposite=j;
+        }
+        for(size_t j=0;j+1<n&&step(opposite)>=0;++j) {
+            if(step(opposite)==0) {
+                testDiameter(a,hull[opposite]);testDiameter(b,hull[opposite]);
+            }
+            opposite=(opposite+1)%n;
+        }
+        const auto p=hull[opposite];
+        testDiameter(a,p);testDiameter(b,p);
+        const double edge=std::hypot(static_cast<double>(dx),static_cast<double>(dy));
+        const double width=static_cast<double>(height(opposite))/edge;
+        if(width<out.minWidth) {
+            out.minWidth=width;
+            out.width={world({p.x+static_cast<double>(dy)/edge*width,p.y-static_cast<double>(dx)/edge*width}),world(p)};
+        }
+        const double area=a.x*b.y-b.x*a.y;
+        twiceArea+=area;cx+=(a.x+b.x)*area;cy+=(a.y+b.y)*area;
+    }
+    if(twiceArea<=0||diameterSquared<=0)return false;
+    out.axisPoint=origin;
+    out.center=world({cx/(3*twiceArea),cy/(3*twiceArea)});
+    out.offset=std::sqrt(norm2(out.center-origin));
+    out.maxDiameter=std::sqrt(diameterSquared);
+    out.equivalentDiameter=2*std::sqrt(twiceArea/(2*Pi));
+    out.ellipticity=100*(1-out.minWidth/out.maxDiameter);
+    return true;
+}
+CylinderMeasurements measureCylinder(const Cloud& cloud,const Cylinder& model,Vec3 u,Vec3 v,
+    const std::atomic_bool* cancel) {
+    constexpr size_t count=20;
+    std::array<std::vector<SectionPoint>,count> sections;
+    double lo=std::numeric_limits<double>::infinity(),hi=-lo;
+    for(size_t i=0;i<cloud.points.size();++i) {
+        if(i%2048==0)cancelled(cancel);
+        if(!model.inliers[i])continue;
+        const Vec3 p=cloud.points[i]-model.center;
+        const double z=dot(p,model.axis);
+        lo=std::min(lo,z);hi=std::max(hi,z);
+        const double relative=std::clamp(z/model.height+0.5,0.0,1.0);
+        const size_t bin=std::min(count-1,static_cast<size_t>(relative*count));
+        sections[bin].push_back({dot(p,u),dot(p,v)});
+    }
+    CylinderMeasurements m;
+    m.length=hi-lo;
+    m.lengthLine={model.center+model.axis*lo,model.center+model.axis*hi};
+    for(size_t i=0;i<count;++i) {
+        cancelled(cancel);
+        const Vec3 origin=model.center+model.axis*(model.height*((i+0.5)/count-0.5));
+        Section s;
+        if(!measureSection(sections[i],origin,u,v,s))continue;
+        const bool first=m.validSections++==0;
+        if(first||s.maxDiameter>m.maxDiameter.maxDiameter)m.maxDiameter=s;
+        if(first||s.minWidth<m.minWidth.minWidth)m.minWidth=s;
+        if(first||s.equivalentDiameter<m.minDiameter.equivalentDiameter)m.minDiameter=s;
+        if(first||s.ellipticity>m.maxEllipticity.ellipticity)m.maxEllipticity=s;
+    }
+    cancelled(cancel);
+    return m;
+}
 } // namespace
+
+AxisAngle measureAxisAngle(const Cylinder& a,const Cylinder& b,const Transform* bToA) {
+    Vec3 direction=b.axis;
+    if(bToA) {
+        const auto& r=bToA->r;
+        direction={r[0]*b.axis.x+r[1]*b.axis.y+r[2]*b.axis.z,
+                   r[3]*b.axis.x+r[4]*b.axis.y+r[5]*b.axis.z,
+                   r[6]*b.axis.x+r[7]*b.axis.y+r[8]*b.axis.z};
+    }
+    if(dot(a.axis,direction)<0)direction=direction*(-1);
+    return {a.axis,direction,std::atan2(std::sqrt(norm2(cross(a.axis,direction))),
+        dot(a.axis,direction))*180/Pi};
+}
+
 Cylinder reconstructCylinder(const Cloud& cloud,double distanceThreshold,const std::atomic_bool* cancel,Progress progress) {
     require(cloud.points.size()>=30,"Cylinder reconstruction requires at least 30 finite points.");
     require(std::isfinite(distanceThreshold)&&distanceThreshold>=0,"Cylinder tolerance must be finite and nonnegative.");
@@ -201,6 +329,8 @@ Cylinder reconstructCylinder(const Cloud& cloud,double distanceThreshold,const s
     out.inlierRatio=static_cast<double>(count)/static_cast<double>(cloud.points.size());
     require(count>=30&&out.inlierRatio>=0.5,"Cylinder support insufficient after axial trimming.");
     out.rmse=std::sqrt(error/static_cast<double>(count));
+    if(progress)progress("Cylinder: measuring observed cross-sections...");
+    out.measurements=measureCylinder(cloud,out,u,v,cancel);
     const size_t rings=25,segments=64;
     for(size_t h=0;h<rings;++h)for(size_t a=0;a<segments;++a) {
         double angle=2*Pi*static_cast<double>(a)/segments;
@@ -231,6 +361,16 @@ void exportCylinder(const std::filesystem::path& dir,const Cloud& source,const C
         <<"\nDistance_threshold="<<model.threshold<<"\nInlier_ratio="<<model.inlierRatio<<"\nRadial_RMSE="<<model.rmse
         <<"\nObserved_arc_degrees="<<model.angularCoverage*180/Pi
         <<"\nOpen-ended full 360-degree analytical side surface; end caps and unobserved areas are not measured.\n";
+    const auto& m=model.measurements;
+    report<<"Point_cloud_length="<<m.length<<"\nValid_sections="<<m.validSections<<"/20\n";
+    if(m.validSections) {
+        const auto& s=m.maxDiameter;
+        report<<"Max_diameter="<<s.maxDiameter<<"\nMin_section_width="<<m.minWidth.minWidth
+              <<"\nMin_section_equivalent_diameter="<<m.minDiameter.equivalentDiameter
+              <<"\nMax_section_ellipticity_percent="<<m.maxEllipticity.ellipticity
+              <<"\nLargest_section_center="<<s.center.x<<' '<<s.center.y<<' '<<s.center.z
+              <<"\nLargest_section_axis_offset="<<s.offset<<'\n';
+    }
     require(bool(report),"Failed to write cylinder report.");
 }
 }

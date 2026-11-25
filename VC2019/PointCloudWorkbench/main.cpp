@@ -21,7 +21,7 @@
 constexpr UINT WM_WORK_DONE = WM_APP + 1;
 constexpr UINT WM_WORK_STATUS = WM_APP + 2;
 struct View {
-    HDC dc=nullptr; HGLRC context=nullptr;
+    HDC dc=nullptr; HGLRC context=nullptr; GLuint fontLists=0;
     double yaw=-25,pitch=20,zoom=1,panX=0,panY=0,radius=1;
     pc::Vec3 center;
     POINT mouse{}; bool left=false,right=false;
@@ -136,6 +136,103 @@ static void DrawCylinderLabels(App& app,const pc::Cloud& cloud,const pc::Cylinde
     }
     glEnd();
 }
+static const pc::Transform* DisplayAlignment(const App& app) {
+    return app.hasResult&&IsDlgButtonChecked(app.dialog,IDC_ORIGINAL)!=BST_CHECKED
+        ?&app.result.bToA:nullptr;
+}
+enum MeasureOverlay { Hidden, All, Diameter, Length, Width, Equivalent, Ellipticity, Offset, Angle };
+static void DrawMeasureValue(const App& app,pc::Vec3 p,const char* name,double value,int row,const char* unit="") {
+    if(!app.view.fontLists)return;
+    std::ostringstream label;
+    label<<name<<' '<<std::setprecision(6)<<value<<unit;
+    const auto text=label.str();
+    glRasterPos3d(p.x,p.y,p.z);
+    glBitmap(0,0,0,0,6,5+row*14.0f,nullptr);
+    glListBase(app.view.fontLists);
+    glCallLists(static_cast<GLsizei>(text.size()),GL_UNSIGNED_BYTE,text.data());
+}
+static void DrawMeasurements(App& app,int selected) {
+    if(selected<=Hidden)return;
+    glDisable(GL_DEPTH_TEST);
+    glLineWidth(2);
+    const auto show=[&](int metric){return selected==All||selected==metric;};
+    for(bool b:{false,true}) {
+        if(!(b?app.hasCylinderB:app.hasCylinderA))continue;
+        const auto& c=b?app.cylinderB:app.cylinderA;
+        const auto& m=c.measurements;
+        const auto vertex=[&](pc::Vec3 p){
+            p=DisplayPoint(app,p,b);glVertex3d(p.x,p.y,p.z);
+        };
+        const auto line=[&](pc::Segment s){
+            glBegin(GL_LINES);vertex(s.from);vertex(s.to);glEnd();
+            glPointSize(6);glBegin(GL_POINTS);vertex(s.from);vertex(s.to);glEnd();
+        };
+        const auto label=[&](pc::Vec3 p,const char* name,double value,int row,const char* unit=""){
+            const std::string caption=std::string(b?"B ":"A ")+name;
+            DrawMeasureValue(app,DisplayPoint(app,p,b),caption.c_str(),value,selected==All?row:0,unit);
+        };
+        glColor3f(b?0.45f:1.0f,b?0.80f:0.46f,b?1.0f:0.78f);
+        if(show(Length)) {
+            line(m.lengthLine);
+            label(m.lengthLine.to,"L",m.length,0);
+        }
+        if(!m.validSections)continue;
+        if(show(Diameter)) {
+            line(m.maxDiameter.diameter);
+            label(m.maxDiameter.diameter.to,"Dmax",m.maxDiameter.maxDiameter,1);
+        }
+        if(show(Width)) {
+            line(m.minWidth.width);
+            label(m.minWidth.width.to,"Wmin",m.minWidth.minWidth,2);
+        }
+        if(show(Equivalent)) {
+            const auto& s=m.minDiameter;
+            const auto d=s.diameter.to-s.diameter.from;
+            const auto u=d*(1/std::sqrt(pc::norm2(d)));
+            const pc::Vec3 v{c.axis.y*u.z-c.axis.z*u.y,c.axis.z*u.x-c.axis.x*u.z,c.axis.x*u.y-c.axis.y*u.x};
+            glBegin(GL_LINE_LOOP);
+            for(int i=0;i<64;++i) {
+                const double angle=6.283185307179586*i/64;
+                vertex(s.center+(u*std::cos(angle)+v*std::sin(angle))*(s.equivalentDiameter*0.5));
+            }
+            glEnd();
+            label(s.center,"Deq",s.equivalentDiameter,3);
+        }
+        if(show(Ellipticity)) {
+            const auto& s=m.maxEllipticity;
+            line(s.diameter);line(s.width);
+            label(s.center,"E",s.ellipticity,4,"%");
+        }
+        if(show(Offset)) {
+            const auto& s=m.maxDiameter;
+            line({s.axisPoint,s.center});
+            label(s.center,"Offset",s.offset,5);
+        }
+    }
+    if(show(Angle)&&app.hasCylinderA&&app.hasCylinderB) {
+        const auto& a=app.cylinderA;
+        const auto angle=pc::measureAxisAngle(a,app.cylinderB,DisplayAlignment(app));
+        const double length=std::max(a.height*0.45,a.radius);
+        const auto vertex=[&](pc::Vec3 direction,double scale){
+            const auto p=a.center+direction*scale-app.view.center;glVertex3d(p.x,p.y,p.z);
+        };
+        glBegin(GL_LINES);
+        glColor3f(1,0.46f,0.78f);vertex({},0);vertex(angle.directionA,length);
+        glColor3f(0.45f,0.8f,1);vertex({},0);vertex(angle.directionB,length);
+        glEnd();
+        glColor3f(1,1,1);glBegin(GL_LINE_STRIP);
+        for(int i=0;i<=32;++i) {
+            const double f=i/32.0;
+            const auto d=angle.directionA*(1-f)+angle.directionB*f;
+            vertex(d,length*0.55/std::sqrt(pc::norm2(d)));
+        }
+        glEnd();
+        const auto bisector=angle.directionA+angle.directionB;
+        DrawMeasureValue(app,a.center+bisector*(length*0.55/std::sqrt(pc::norm2(bisector)))-app.view.center,
+            "A/B",angle.degrees,0," deg");
+    }
+    glLineWidth(1);glEnable(GL_DEPTH_TEST);
+}
 static void Paint(HWND window) {
     PAINTSTRUCT ps{};BeginPaint(window,&ps);
     auto* app=GetApp(GetParent(window));
@@ -164,6 +261,7 @@ static void Paint(HWND window) {
         if(app->hasCylinderA)DrawCylinder(*app,app->cylinderA,false);
         if(app->hasCylinderB)DrawCylinder(*app,app->cylinderB,true);
     }
+    DrawMeasurements(*app,static_cast<int>(SendDlgItemMessageW(app->dialog,IDC_MEASURE_OVERLAY,CB_GETCURSEL,0,0)));
     SwapBuffers(v.dc);EndPaint(window,&ps);
 }
 static LRESULT CALLBACK ViewProc(HWND window,UINT message,WPARAM wParam,LPARAM lParam) {
@@ -203,7 +301,7 @@ static LRESULT CALLBACK ViewProc(HWND window,UINT message,WPARAM wParam,LPARAM l
 static void Layout(HWND dialog) {
     RECT r{};GetClientRect(dialog,&r);int width=r.right,height=r.bottom;
     // Top controls retain font-scaled resource positions; the view and report stretch.
-    RECT top{0,0,8,116};MapDialogRect(dialog,&top);
+    RECT top{0,0,8,146};MapDialogRect(dialog,&top);
     RECT report{0,0,0,84};MapDialogRect(dialog,&report);
     RECT status{0,0,0,18};MapDialogRect(dialog,&status);
     int margin=top.right,viewTop=top.bottom,content=std::max(0,width-2*margin);
@@ -225,7 +323,15 @@ static bool InitGL(App& app) {
     int format=ChoosePixelFormat(app.view.dc,&pfd);
     if(!format||!SetPixelFormat(app.view.dc,format,&pfd)) return false;
     app.view.context=wglCreateContext(app.view.dc);
-    return app.view.context&&wglMakeCurrent(app.view.dc,app.view.context);
+    if(!app.view.context||!wglMakeCurrent(app.view.dc,app.view.context))return false;
+    const GLuint lists=glGenLists(127);
+    if(lists) {
+        const auto oldFont=SelectObject(app.view.dc,GetStockObject(ANSI_FIXED_FONT));
+        if(wglUseFontBitmapsW(app.view.dc,32,95,lists+32))app.view.fontLists=lists;
+        else glDeleteLists(lists,127);
+        if(oldFont)SelectObject(app.view.dc,oldFont);
+    }
+    return true;
 }
 static void Launch(App& app,int action,const std::filesystem::path& path={},double threshold=0) {
     app.cancel=false;Busy(app,true);Status(app,L"正在处理，可点击“取消计算”停止……");
@@ -276,9 +382,28 @@ static void ResultsText(App& app) {
            <<L"，重建长度="<<c.height<<L"，径向 RMSE="<<c.rmse<<L"，内点率="<<std::setprecision(2)<<100*c.inlierRatio<<L"%"
            <<L"\r\n轴方向=("<<std::setprecision(5)<<c.axis.x<<L", "<<c.axis.y<<L", "<<c.axis.z
            <<L")，阈值="<<c.threshold<<L"，原始坐标系。黄色模型为完整圆周外推的开口侧面。";
+        const auto& m=c.measurements;
+        out<<std::setprecision(6)<<L"\r\n测量 "<<(b?L"B":L"A")<<L"：点云长度="<<m.length
+           <<L"，有效截面="<<m.validSections<<L"/20";
+        if(m.validSections) {
+            const auto& largest=m.maxDiameter;
+            out<<L"\r\n最大直径="<<largest.maxDiameter<<L"，最小截面长度="<<m.minWidth.minWidth
+               <<L"，最小截面直径="<<m.minDiameter.equivalentDiameter
+               <<L"，最大截面椭圆率="<<m.maxEllipticity.ellipticity<<L"%"
+               <<L"\r\n最大截面轴心位置偏差="<<largest.offset;
+            const auto center=b&&DisplayAlignment(app)?app.result.bToA.apply(largest.center):largest.center;
+            out<<L"，轴心=("<<center.x<<L", "<<center.y<<L", "<<center.z<<L")";
+        } else out<<L"；截面取样覆盖不足，截面测量不可用。";
+    }
+    if(app.hasCylinderA&&app.hasCylinderB) {
+        const auto* alignment=DisplayAlignment(app);
+        const auto angle=pc::measureAxisAngle(app.cylinderA,app.cylinderB,alignment);
+        out<<L"\r\nA/B 轴线夹角="<<std::setprecision(6)<<angle.degrees
+           <<L"°（"<<(alignment?L"配准后":L"原始位置")<<L"）";
     }
     if(!app.hasResult&&!app.hasCylinderA&&!app.hasCylinderB)out<<L"读取完成。可配准比较，或对 A/B 进行单圆柱重建。";
     SetDlgItemTextW(app.dialog,IDC_RESULTS,out.str().c_str());
+    SendDlgItemMessageW(app.dialog,IDC_RESULTS,EM_SETSEL,0,0);
 }
 static void Finish(App& app,std::unique_ptr<WorkResult> work) {
     if(app.worker.joinable()) app.worker.join();
@@ -338,6 +463,10 @@ static INT_PTR CALLBACK DialogProc(HWND dialog,UINT message,WPARAM wParam,LPARAM
         app=reinterpret_cast<App*>(lParam);app->dialog=dialog;
         SetWindowLongPtrW(dialog,DWLP_USER,reinterpret_cast<LONG_PTR>(app));
         SetDlgItemTextW(dialog,IDC_THRESHOLD,L"0");SetDlgItemTextW(dialog,IDC_CYL_THRESHOLD,L"0");
+        for(const wchar_t* label:{L"隐藏测量",L"全部测量",L"最大直径",L"点云长度",
+            L"最小截面长度",L"最小截面直径",L"最大截面椭圆率",L"最大截面轴心位置偏差",L"A/B 轴线夹角"})
+            SendDlgItemMessageW(dialog,IDC_MEASURE_OVERLAY,CB_ADDSTRING,0,reinterpret_cast<LPARAM>(label));
+        SendDlgItemMessageW(dialog,IDC_MEASURE_OVERLAY,CB_SETCURSEL,0,0);
         CheckDlgButton(dialog,IDC_CYL_SHOW,BST_CHECKED);Busy(*app,false);Layout(dialog);
         if(!InitGL(*app)) {MessageBoxW(dialog,L"无法初始化 OpenGL，请检查显卡驱动或远程桌面的 OpenGL 支持。",L"启动失败",MB_OK|MB_ICONERROR);EndDialog(dialog,1);}
         else Refresh(*app);
@@ -345,7 +474,7 @@ static INT_PTR CALLBACK DialogProc(HWND dialog,UINT message,WPARAM wParam,LPARAM
     case WM_SIZE:if(app&&wParam!=SIZE_MINIMIZED) Layout(dialog);return TRUE;
     case WM_GETMINMAXINFO: {
         // Resource toolbar must remain usable. No custom maximum size.
-        RECT rect{0,0,736,350};MapDialogRect(dialog,&rect);
+        RECT rect{0,0,736,380};MapDialogRect(dialog,&rect);
         AdjustWindowRectEx(&rect,static_cast<DWORD>(GetWindowLongPtrW(dialog,GWL_STYLE)),FALSE,static_cast<DWORD>(GetWindowLongPtrW(dialog,GWL_EXSTYLE)));
         auto* limits=reinterpret_cast<MINMAXINFO*>(lParam);
         limits->ptMinTrackSize={rect.right-rect.left,rect.bottom-rect.top};return TRUE;
@@ -379,7 +508,10 @@ static INT_PTR CALLBACK DialogProc(HWND dialog,UINT message,WPARAM wParam,LPARAM
                 CheckDlgButton(dialog,IDC_DIFF_ONLY,BST_UNCHECKED);
             Refresh(*app);return TRUE;
         case IDC_FIT:if(!app->busy) FitView(*app);return TRUE;
-        case IDC_ORIGINAL:FitView(*app);return TRUE;
+        case IDC_MEASURE_OVERLAY:
+            if(HIWORD(wParam)==CBN_SELCHANGE)Refresh(*app);
+            return TRUE;
+        case IDC_ORIGINAL:ResultsText(*app);FitView(*app);return TRUE;
         case IDC_DIFF_ONLY:
             if(IsDlgButtonChecked(dialog,IDC_DIFF_ONLY)==BST_CHECKED)CheckDlgButton(dialog,IDC_CYL_LABELS,BST_UNCHECKED);
             Refresh(*app);return TRUE;

@@ -38,6 +38,38 @@ int main(int argc,char** argv){
         organized.points.push_back({0.7*std::cos(angle),0.7*std::sin(angle),3.0*h/5999});}
     auto ordered=pc::reconstructCylinder(organized,0.006);
     expect(std::abs(ordered.radius-0.7)<0.001&&std::abs(ordered.axis.z)>0.999,"Organized ring scan sampling");
+    const auto& round=ordered.measurements;
+    expect(round.validSections==20&&std::abs(round.length-ordered.height)<0.013,"Round measurement coverage and length");
+    expect(std::abs(round.maxDiameter.maxDiameter-1.4)<0.002,"Maximum diameter");
+    expect(std::abs(round.minWidth.minWidth-1.4*std::cos(3.141592653589793/64))<0.002,"Minimum caliper width");
+    expect(std::abs(round.minDiameter.equivalentDiameter-1.4)<0.003,"Minimum area-equivalent diameter");
+    expect(round.maxEllipticity.ellipticity<0.4&&round.maxDiameter.offset<0.002,"Round ellipticity and axis offset");
+    expect(partial.measurements.validSections==0&&partial.measurements.length>2.8,"Incomplete arc only supports length");
+
+    pc::Cloud oval;
+    for(int h=0;h<41;++h)for(int k=0;k<96;++k) {
+        const double angle=6.283185307179586*k/96;
+        const double axial=(h-20)*0.1;
+        const bool bulge=std::abs(axial)<0.21;
+        oval.points.push_back({(bulge?0.79:0.73)*std::cos(angle)+(bulge?0.04:0),
+                              0.67*std::sin(angle),axial});
+    }
+    const auto deformed=pc::reconstructCylinder(oval,0.15);
+    const auto& dimensions=deformed.measurements;
+    expect(dimensions.validSections==20&&dimensions.length>3.9,"Oval coverage and length");
+    expect(std::abs(dimensions.maxDiameter.maxDiameter-1.58)<0.07,"Oval largest diameter");
+    expect(std::abs(dimensions.minWidth.minWidth-1.34)<0.035,"Oval minimum caliper width");
+    expect(std::abs(dimensions.minDiameter.equivalentDiameter-2*std::sqrt(0.73*0.67))<0.025,"Oval minimum equivalent diameter");
+    expect(dimensions.maxEllipticity.ellipticity>12&&dimensions.maxEllipticity.ellipticity<24,"Oval ellipticity");
+    expect(dimensions.maxDiameter.offset>0.02&&dimensions.maxDiameter.offset<0.08,"Local section center offset");
+
+    pc::Cylinder first,second;
+    first.axis={0,0,1};second.axis={-0.5,0,-std::sqrt(0.75)};
+    expect(std::abs(pc::measureAxisAngle(first,second).degrees-30)<1e-9,"Unsigned native axis angle");
+    pc::Transform transform;
+    transform.r={std::sqrt(0.75),0,-0.5,0,1,0,0.5,0,std::sqrt(0.75)};
+    transform.t={100,-200,300};
+    expect(pc::measureAxisAngle(first,second,&transform).degrees<1e-9,"Aligned axis angle ignores translation");
     auto autoResult=pc::reconstructCylinder(cylinder(0.7,3));expect(autoResult.inlierRatio>0.95,"Automatic threshold");
     auto moved=cylinder(0.7,3);for(auto& p:moved.points)p=p+pc::Vec3{1e6,-1e6,1e6};
     auto distant=pc::reconstructCylinder(moved,0.012);expect(std::abs(distant.radius-0.7)<0.01,"Large world offset");
